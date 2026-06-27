@@ -1,0 +1,1024 @@
+---
+title: "Acute Myocardial Infarction - 30-day mortality"
+subtitle: "Data analysis and prognostic model building."
+author: "Arhin Claribel Akua Tawiah, Bragagnolo Sofia, Guccione Anna, Maia Tavora Leticia"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(epitools)
+library(corrplot)
+library(gtsummary)
+library(knitr)
+library(kableExtra)
+library(car)
+library(rms)
+library(pROC)
+library(mgcv)
+library(caret)
+library(dplyr)
+library(glmnet)
+library(splines)
+library(ResourceSelection)
+```
+
+# Question 1
+
+> Start with an initial data analysis, comparing patients dead versus patients alive at 30 days. 
+Insert also a column with the total population descriptive statistics. Include also a new
+variable, the Body Mass Index
+
+## Introduction
+
+**Acute Myocardial Infarction (MI)** (“heart attack”) is caused by the formation 
+of a clot in one of the coronary arteries that supply blood to the heart muscle.
+Mortality is substantial in the period immediately after the event 
+(and during the years after surviving the initial infarction). 
+
+The final aim of this project is to predict the probability of 30-day mortality following an AMI. 
+
+Therefore, the objective of this first part of the analysis is to explore the characteristics of the patients included in the study and compare subjects who were alive at 30 days with those who died within 30 days.
+
+Before fitting regression models, it is important to understand how the variables are distributed, whether there are possible differences between the two groups, and whether the data contain unusual values or missing information. This initial exploration also helps us identify variables that could later become important predictors in the prognostic model.
+Another important step is the creation of the Body Mass Index (BMI), which is not directly available in the dataset but can be calculated using height and weight.
+
+## Data loading
+
+```{r load}
+data <- read_excel('./AMI_data.xlsx')
+```
+
+### Dimensions
+The dataset initally includes 3661 patients and 21 variables (20 candidate predictors + 1 outcome variable).
+```{r rows}
+data.frame(
+  'patients'  = nrow(data),
+  'factors'   = ncol(data)) %>% 
+  kable(col.names = c("# of patients", "# of prognostic factors"), caption = "Dataset dimensions") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("bordered"))
+```
+
+
+### Missing values
+Checking for missing values:
+```{r missing}
+colSums(is.na(data))
+```
+There is no missing values in the data.
+
+### Dataset description
+
+```{r description}
+head(data)
+```
+
+```{r str}
+str(data)
+```
+
+> Although the raw dataset encodes every variable numerically, they fundamentally belong to different statistical types:
+
+
+| Variable Name | Clinical Description                  | Statistical Type       | Coding / Units in Raw Data                             |   |
+|---------------|---------------------------------------|------------------------|--------------------------------------------------------|---|
+| day30         | 30-day vital status (Primary Outcome) | Categorical (Binary)   | 0 = Alive, 1 = Dead                                    | 
+| sex           | Patient biological sex                | Categorical (Binary)   | 0 = Male, 1 = Female                                   | 
+| age           | Age at presentation                   | Numerical (Continuous) | Years                                                  | 
+| a65           | Age threshold indicator               | Categorical (Binary)   | 0 = Under 65, 1 = 65 or older                          | 
+| killip        | Killip class (Heart failure severity) | Categorical (Ordinal)  | 1 = None, 2 = Rales/S3, 3 = Pulmonary edema, 4 = Shock | 
+| sho           | Cardiogenic shock status              | Categorical (Binary)   | 0 = No, 1 = Yes (Killip class 3 or 4)                  | 
+| dia           | Diabetes mellitus history             | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| hyp           | Hypotension status                    | Categorical (Binary)   | 0 = No, 1 = Yes (Systolic Blood Pressure < 100 mmHg)   | 
+| hrt           | Tachycardia status                    | Categorical (Binary)   | 0 = No, 1 = Yes (Pulse rate > 80 bpm)                  | 
+| ant           | Infarction location                   | Categorical (Binary)   | 0 = Other, 1 = Anterior infarct                        | 
+| pmi           | Previous myocardial infarction        | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| hei           | Height                                | Numerical (Continuous) | Centimeters (cm)                                       | 
+| wei           | Weight                                | Numerical (Continuous) | Kilograms (kg)                                         | 
+| htn           | Hypertension history                  | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| smk           | Smoking status                        | Categorical (Nominal)  | 1 = Never, 2 = Ex-smoker, 3 = Current smoker           | 
+| lip           | Hypercholesterolaemia                 | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| pan           | Previous angina                       | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| fam           | Family history of MI                  | Categorical (Binary)   | 0 = No, 1 = Yes                                        | 
+| ste           | Number of ECG leads with ST elevation | Numerical (Count)      | Number of leads                                        | 
+| st4           | Extensive ST elevation threshold      | Categorical (Binary)   | 0 = 4 leads or fewer, 1 = More than 4 leads            | 
+| ttr           | Time to pain relief                   | Categorical (Binary)   | 0 = 1 hour or less, 1 = Greater than 1 hour            | 
+
+
+> Consequently, treating these variables purely as numerical would invalidate regression assumptions. To ensure a clear interpretation these should be converted into factors.
+
+## Data preparation
+
+### BMI variable
+
+We create the BMI variable following the formula:
+$BMI=\frac{weight(kg)}{height(m)^2}$
+
+```{r add-bmi}
+data$bmi <- data$wei/(data$hei/100)^2
+```
+
+### Factors labels
+
+```{r labels}
+pretty_labels <- list(
+    sex    ~ "Sex",
+    age    ~ "Age (years)",
+    bmi    ~ "Body Mass Index (kg/m^2)",
+    killip ~ "Killip class",
+    sho    ~ "Shock (Killip 3/4)",
+    dia    ~ "Diabetes",
+    hyp    ~ "Hypotension (SBP < 100)",
+    hrt    ~ "Tachycardia (pulse > 80)",
+    ant    ~ "Anterior infarct location",
+    pmi    ~ "Previous MI",
+    htn    ~ "Hypertension history",
+    smk    ~ "Smoking status",
+    lip    ~ "Hypercholesterolaemia",
+    pan    ~ "Previous angina",
+    fam    ~ "Family history of MI",
+    ste    ~ "ST elevation (n leads)",
+    st4    ~ "ST elevation > 4 leads",
+    ttr    ~ "Time to pain relief > 1h"
+  )
+status_colors <- c("Alive" = "#519e8a", "Dead" = "#E5625E")
+```
+
+### Converting to factors
+
+We convert variables into factors for easier interpretation:
+
+```{r day30}
+ami_data <- data %>%
+  mutate(
+    day30 = factor(day30, levels = c(0, 1), labels = c("Alive", "Dead")),
+    sex   = factor(sex,   levels = c(0, 1), labels = c("Male", "Female")),
+    
+    across(
+      c(a65, sho, dia, hyp, hrt, ant, pmi, htn, lip, pan, fam, st4, ttr),
+      ~ factor(.x, levels = c(0, 1), labels = c("No", "Yes"))
+    ),
+    
+    killip = factor(killip, levels = c(1, 2, 3, 4)),
+    smk    = factor(smk, levels = c(1, 2, 3), labels = c("Never", "Ex", "Current"))
+  )
+
+head(ami_data)
+```
+
+Note that to avoid structural multi-collinearity, `a65`, `sho`, `hei`, `wei` and `st4` are excluded from the final multivariable model.
+
+  * `a65` is a binary age-derived indicator (age ≥ 65) and is therefore excluded to avoid redundancy with continuous variable `age`
+  * `hei` and `wei` are used only to compute `BMI` and are not treated as separate candidate predictors in the predictive model
+  * `sho` is derived from `Killip` (Shock = Killip 3 or 4)
+  * `st4` is derived from `ste`
+
+Note that we still included `sho` and `st4` in the exploratory steps.
+
+## Exploring the data
+From this initial distribution for a 30-day window, we can see a substantial class imbalance. Surviving patients significantly outnumber deceased patients.
+```{r death}
+ggplot(ami_data) +
+  geom_bar(aes(x = day30, fill = day30), stat = "count") +
+  scale_fill_manual(name = "Status", values = status_colors) +
+  theme_minimal()
+```
+
+### Cumulative incidence
+This analysis uses `binom.exact` from the `epitools` package, which calculates the exact binomial confidence interval for the mortality rate.
+```{r ci}
+n_dead  <- sum(ami_data$day30 == "Dead")
+n_total <- nrow(ami_data)
+inc <- binom.exact(n_dead, n_total)
+data.frame(
+  'Deaths'  = n_dead,
+  'Total'   = n_total,
+  'Perc' = round(inc$proportion * 100, 2),
+  'CI lower' = round(inc$lower * 100, 2),
+  'CI upper' = round(inc$upper * 100, 2)
+) %>% kable(col.names = c("Deaths", "Total cohort (N)", "Incidence (%)", "95% CI lower", "95% CI upper"), caption = "Cumulative 30-Day Mortality Incidence") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("bordered"))
+```
+
+The 30-day mortality rate after acute myocardial infarction is relatively low (6.31$\%$), indicating that most patients survived the acute phase. However, this mortality rate remains clinically important because 1 in approximately 16 patients died within 30 days (100/6.31=15.848 $\approx$ 16)
+
+### Outcome balance and events per variable (EPV)
+To safely build our prognostic regression model, we must assess the **Events per Variable (EPV)**. For a reliable multivariable logistic regression model that avoids severe overfitting, guidelines generally recommend a minimum baseline of 10 to 15 events (deaths) per estimated parameter.
+
+After excluding redundant and derived variables (`a65`, `sho`, `st4`, `hei`, and `wei`), our final model consists of **16 unique candidate predictors**. 
+With 231 total deaths, our dataset yields an EPV of approximately **14.44** per variable. 
+
+```{r epv}
+n_predictors <- 16
+epv <- n_dead / n_predictors
+data.frame(
+  'Deaths' = n_dead,
+  'Predictors' = n_predictors,
+  'EPV' = round(epv, 2),
+  'Recommended minimum' = '10-15'
+) %>% kable(caption = 'EPV assessment for candidate prognostic predictors') %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c('bordered'))
+```
+Note on outcome balance: $\approx 6.31 \%$ of the sample are deaths. If the death proportion is below 10–15%, rare predictors may lead to separation issues in logistic regression.
+
+### Descriptive statistics
+To compare baseline characteristics between patients who survived and those who died within 30 days, we utilize the Standardized Mean Difference (SMD) rather than traditional p-values.
+
+In large clinical datasets, traditional p-values are highly sensitive to sample size and can flag trivial differences as "highly statistically significant." 
+
+Interpeting SMD tresholds:
+
+  - negligible difference     < 0.1     
+  - small difference          0.1-0.3   
+  - moderate difference       0.3-0.5   
+  - large (clinically substantial) difference   > 0.5     
+
+Here we present the table with the characteristics ordered by the absolute value of the SMD.
+```{r summary}
+tbl_summary(ami_data, by=day30, 
+            include = c(age, killip, sho, ant, hrt, ste, st4, smk, hyp, pmi, sex, bmi, pan, ttr, dia, fam, htn, lip),
+            label = pretty_labels) %>% add_overall() %>% add_stat_label() %>% bold_labels() %>% add_difference(everything() ~ "smd") %>% 
+  modify_spanning_header(all_stat_cols() ~ "**After 30 days**") %>% modify_caption(
+    "**Table 1. Baseline characteristics by 30-day vital status**"
+  )
+```
+
+1. Large differences (SMD > 0.5)
+  * Age ($−0.9$): deceased patients are older (median of 73 years) compared to those who survived (median of 60 years). The negative SMD for age means the "Alive" group has a lower value than the "Dead" group (The Dead group is much older). This indicates a substantial difference in age distribution between patients who survived and those who died within 30 days.
+  * Killip (0.67): severe heart failure at presentation is a massive indicator of mortality
+
+2. Moderate differences (SMD 0.3-0.5)
+  * Deceased patients presented much higher rates of `sho` (13% vs. 0.9%), `ant` (57% vs. 35%), `hrt` (51% vs. 30%), and `hyp` (19% vs. 8.0%).
+  * BMI (0.32): shows a moderate positive difference. Surviving patients had a higher median BMI (26.9  $\text{kg/m}^2$) than those who died (25.3  $\text{kg/m}^2$)
+
+### Correlation matrix
+We convert our factored variables into numeric values. We include the variables targeted for exclusion (sho, st4, a65) to demonstrate their underlying collinearity.
+
+The correlation matrix clearly exposes the redundancy of the derived clinical variables, validating the exclusion:
+* age and a65 show a high correlation (a65 is a binary split of the continuous age variable)
+* killip and sho show a high correlation (confirming that sho is formed by Killip classes 3 and 4)
+* ste and st4 show a high correlation (st4 is redundant).
+
+```{r corr_all}
+corr_data <- ami_data %>%
+  select(day30, age, a65, killip, sho, ant, hrt, ste, st4, hyp, pmi, sex, bmi, pan, ttr, dia, fam, htn, lip) %>%
+  mutate(across(everything(), ~ as.numeric(.x)))
+corr_matrix <- cor(corr_data, use = "complete.obs")
+corrplot(corr_matrix, method = "color", type = "upper", tl.cex = 0.8)
+```
+
+```{r}
+print(round(corr_matrix[c("age","a65","killip","sho","ste","st4"),
+                        c("age","a65","killip","sho","ste","st4")], 2))
+```
+
+## Visual summary
+This section presents graphical summaries of key predictors and their relationship with 30-day mortality, helping to identify distributional patterns and group differences before model building.
+
+### Age
+From the plots below we can see how older age is strongly associated with 30-day mortality. Patients who died were substantially older, suggesting age is a major prognostic factor after MI.
+```{r age}
+ggplot(ami_data, aes(x = age, fill = day30, colour = day30)) +
+  geom_density(alpha = 0.4, linewidth = 0.8) +
+  scale_fill_manual(values  = status_colors) +
+  scale_colour_manual(values = status_colors) +
+  labs(title = "Age density by 30-day status", x = "Age (years)", y = "Density",
+       fill = "30-day status", colour = "30-day status") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold"))
+
+ggplot(ami_data, aes(x = day30, y = age, fill = day30)) +
+  geom_violin(alpha = 0.5, trim = TRUE, colour = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.5, alpha = 0.7) +
+  scale_fill_manual(values = status_colors) +
+  labs(title = "Age distribution boxplot", x = "Patient status at 30 days", y = "Age (years") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right", plot.title = element_text(face = "bold"))
+```
+
+### Killip
+
+Mortality increases with increasing Killip class, higher Killip class (3,4) reflects more severe heart failure after MI.
+
+We can see that Killip IV has only 19 patients, of which 11 are deaths. 
+This suggests potential instability in the estimated odds ratio for Killip IV due to the small sample size.
+
+```{r}
+killip_tab <- ami_data %>%
+  group_by(killip) %>%
+  summarise(
+    Alive = sum(day30 == "Alive"),
+    Dead = sum(day30 == "Dead"),
+    Total = n(),
+    Mortality_rate = round(100 * Dead / Total, 1)
+  )
+killip_tab
+```
+```{r killip-graph}
+ami_data %>%
+  count(killip, day30) %>%
+  group_by(killip) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(day30 == "Dead") %>%
+  ggplot(aes(x = killip, y = pct, fill = killip)) +
+  geom_col(colour = "white", width = 0.7) +
+  geom_text(aes(label = scales::percent(pct, accuracy = 0.1)),
+            vjust = -0.4, size = 3.8, fontface = "bold") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.65)) +
+  scale_fill_brewer(palette = "Reds") +
+  labs(title = "30-day mortality rate by Killip class",
+       x = "Killip class", y = "Mortality rate") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", plot.title = element_text(face = "bold"))
+```
+
+### ST elevation
+Greater ST segment elevation is clearly associated with a higher probability of death, suggesting that more extensive myocardial involvement worsens an acute prognosis.
+```{r ste-graph}
+ggplot(ami_data, aes(x = ste)) +
+  geom_freqpoly(binwidth = 1, color = "steelblue") +
+  labs(title = "ST elevation on ECG (number of leads)") + theme_minimal()
+
+ami_data %>%
+  group_by(ste, day30) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ste) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(day30 == "Dead") %>%
+  ggplot(aes(x = ste, y = pct)) +
+  geom_col(fill = "#B71C1C") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Mortality by ST elevation in ECG presence",
+       x = "ST elevation", y = "Mortality rate") +
+  theme_bw(base_size = 11) + theme_minimal()
+```
+
+### Sex
+
+Female patients show a higher raw proportion of 30-day mortality compared to male patients.
+```{r sex-graph}
+ami_data %>%
+  group_by(sex) %>%
+  summarise(
+    Deaths = sum(day30 == "Dead"),
+    Total = n(),
+    Mortality_Rate = Deaths / Total,
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = sex, y = Mortality_Rate, fill = sex)) +
+  geom_col(width = 0.5, colour = "white", alpha = 0.8) +
+  geom_text(
+    aes(label = sprintf("%.1f%%\n(%d / %d)", Mortality_Rate * 100, Deaths, Total)),
+    vjust = -0.3, 
+    lineheight = 0.9, 
+    fontface = "bold", 
+    size = 4
+  ) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.13)) +
+  labs(
+    title = "30-day mortality rate by sex",
+    x = "Sex",
+    y = "Mortality rate"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### BMI
+Patients who died tended to have lower BMI values.
+```{r bmi-graph}
+ggplot(ami_data, aes(x = bmi, fill = day30, colour = day30)) +
+  geom_density(alpha = 0.4, linewidth = 0.8) +
+  scale_fill_manual(values  = status_colors) +
+  scale_colour_manual(values = status_colors) +
+  labs(title = "BMI distribution", x = "BMI (kg/m^2)", y = "Density",
+       fill = "30-day status", colour = "30-day status") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold")) + theme_minimal()
+
+ggplot(ami_data, aes(x = day30, y = bmi, fill = day30)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.size = 0.5, alpha = 0.7) +
+  scale_fill_manual(values = status_colors) +
+  labs(title = "BMI by 30-day status", x = NULL, y = "BMI") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none") + theme_minimal()
+```
+
+### Hypotension
+Patients presenting with hypotension had substantially higher mortality rates.
+```{r hypo-sex}
+ami_data %>%
+  count(hyp, day30) %>%
+  group_by(hyp) %>%
+  mutate(rate = n / sum(n)) %>%
+  filter(day30 == "Dead") %>%
+  ggplot(aes(x = hyp, y = rate, fill = hyp)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  labs(
+    title = "30-day mortality by hypotension status",
+    x = "Hypotension",
+    y = "Mortality rate"
+  )
+```
+
+---
+
+# Question 2
+
+> Perform univariable regression analyses (crude association measures) of all candidate
+predictors for your prognostic model. For the continuous variables is the linear effect
+reasonable?
+
+## Crude odds and univariable analysis
+The table below displays the crude associations between each predictor and 30-day mortality. 
+
+* **Strongest Predictors:** **Killip Class IV** exhibits the highest point estimate, increasing the odds of death nearly 29-fold (**OR = 28.91**, 95% CI: 11.5–75.6) compared to Class I. This is mirrored by the **Shock** variable (**OR = 15.8**). **Hypotension** nearly triples the risk (**OR = 2.79**), and **Tachycardia** more than doubles it (**OR = 2.39**).
+
+* **Anterior infarct location** more than doubles mortality odds (**OR = 2.43**). For **ST elevation**, every additional lead increases the odds of death by 20% (**OR = 1.20**), while having > 4 leads elevated (**st4**) doubles the risk (**OR = 2.01**).
+* **Age** increases the odds of death by 10% per year (**OR = 1.10**). **Female sex** (**OR = 1.98**), **Prior MI** (**OR = 2.24**), and **Current smoking** (**OR = 2.23**) all roughly double the crude odds of mortality. **BMI** shows an inverse relationship (**OR = 0.92**), indicating that a lower body mass is associated with higher acute mortality.
+
+```{r crude-or}
+tbl_uvregression(
+  ami_data,
+  label = pretty_labels,
+  method   = glm,
+  y        = day30,
+  method.args = list(family = binomial),
+  exponentiate = TRUE,
+  include  = c(age, killip, sho, ant, hrt, ste, st4, smk, hyp, pmi, sex, bmi, pan, ttr, dia, fam, htn, lip)
+) %>% bold_labels()
+```
+
+## Evaluating the linearity assumption for continuous variables
+To determine if a linear effect is reasonable for our continuous predictors, we examine how the risk behaves across their ranges on the log-odds scale.
+We formally test this assumption by comparing a standard linear model against a non-linear model utilizing restricted cubic splines with 3 knots (rcs(..., 3)). A Likelihood Ratio Test (LRT) is then applied to assess whether the spline model offers a statistically significant improvement in fit.
+
+Age, ST Elevation, and BMI are the only true continuous variables in our dataset. 
+The other variables are binary or categorical and do not require this linearity assessment.
+```{r lin}
+dd <- datadist(ami_data)
+options(datadist = "dd")
+
+check_linearity <- function(var, label) {
+  f_lin  <- glm(day30 ~ get(var), data = ami_data, family = binomial)
+  f_spl  <- glm(day30 ~ rcs(get(var), 3), data = ami_data, family = binomial)
+  p_val  <- anova(f_lin, f_spl, test = "LRT")$`Pr(>Chi)`[2]
+  cat(sprintf("%-6s — LRT linearity p = %.3f  %s\n",
+              label, p_val,
+              ifelse(p_val < 0.05, "non-linear", "linear OK")))
+}
+
+check_linearity("age", "Age")
+check_linearity("ste", "ST elevation")
+check_linearity("bmi", "BMI")
+```
+
+* Age (p = 0.007): The LRT rejects strict linearity.
+* ST Elevation (p = 0.809): The non-significant p-value confirms the linearity assumption.
+* BMI (p < 0.001): Linearity is strongly rejected.
+
+### GAM Plots
+
+To visually inspect the log-linear relationship assumed by logistic regression, we fit a Generalized Additive Model (GAM) using a penalized regression spline (s()) for each continuous variable. 
+```{r vis}
+plot_linearity <- function(var, xlab) {
+  fit <- gam(as.numeric(day30) - 1 ~ s(get(var)), data = ami_data, family = binomial)
+  plot(fit, se = TRUE, rug = TRUE,
+       xlab = xlab, ylab = "Log-odds (30-day death)",
+       main = paste("GAM smooth —", xlab))
+  abline(h = 0, lty = 2)
+}
+
+par(mfrow = c(1, 3))
+plot_linearity("age", "Age (years)")
+plot_linearity("ste", "ST elevation (leads)")
+plot_linearity("bmi", "BMI (kg/m^2)")
+par(mfrow = c(1, 1))
+```
+
+The lines represent the estimated smooth effect on the log-odds of 30-day mortality, the dashed lines indicate the 95% confidence intervals, and the bottom displays the individual patient observations.
+
+* **Age** The relationship is clearly curvilinear. The risk curve rises gradually from around age 25, then accelerates sharply upward from age 40–45, with the log-odds of death crossing zero around age 55–60. This monotonically increasing, non-linear pattern means that forcing a single straight line would underestimate mortality risk in elderly patients and overestimate it in younger ones. This justifies the use of a spline transformation.
+
+* **ST** The curve follows a linear upward trend across the most populated range of the data (0–8 leads), with each additional lead associated with a fairly steady increase in the log-odds of death. A slight flattening is visible beyond 6–8 leads, but the confidence intervals widen considerably in that region due to sparse data, making the tail unreliable. Given that the LRT fails to reject linearity (p = 0.809), a linear term is accepted as a reasonable approximation for this variable.
+
+* **BMI** The log-odds of death decrease steeply as BMI rises from the lowest values, reaching minimum around 30 $kg/m^2$. Beyond 30 $kg/m^2$, the curve gradually turns upward. However, the confidence intervals become very wide past approximately 35 $kg/m^2$, reflecting the small number of patients in that range and making the upturn statistically uncertain. The non-linear shape justifies modeling BMI with a spline transformation.
+
+---
+
+# Question 3
+
+> Build a multivariable prognostic model: 
+>
+> As you know, various selection procedures of the candidate predictors could be performed (try different approaches and compare them… we don’t have here the expert’s opinion, therefore the final choice will be based only on statistical evaluations with the aim of maximising predictive accuracy). 
+>
+> Pay attention to the multicollinearity between predictors (and to use the same variables but recoded in different ways)
+
+## Preprocessing
+To begin our modelling, we first transform the Killip variable to two different variables: `killip2` and `killip3`.
+
+- **Killip2** is a binary variable: 0 for a Killip score of 1, and 1 for Killip scores of 2, 3, and 4.
+- **Killip3** is an ordinal variable: a Killip score of 1 maps to 3, a score of 2 maps to 2, and scores of 3 and 4 map to 1.
+
+```{r killip}
+data <- data %>%
+  mutate(killip2 = case_when(
+    killip == 1 ~ 0,
+    killip %in% c(2, 3, 4) ~ 1
+  ))
+ 
+data <- data %>%
+  mutate(killip3 = case_when(
+    killip == 1 ~ 3,
+    killip == 2 ~ 2,
+    killip %in% c(3, 4) ~ 1
+  ))
+```
+
+The aim of this study is to build a predictive prognostic model that estimates the probability of dying within the first 30 days after a myocardial infarction, considering several candidate predictors. Predictive models summarise the effects of multiple predictors to provide more individualised risk estimates.
+
+To begin, the dataset is split into 70% training and 30% test sets. This split allows us to train and tune the model on the training set, and then evaluate its generalisability on unseen data.
+
+```{r data-test-train}
+set.seed(123)
+trainIndex <- createDataPartition(data$day30, p = 0.7, list = FALSE)
+train <- data[trainIndex, ]
+test  <- data[-trainIndex, ]
+dd <- datadist(train)
+options(datadist = "dd")
+```
+
+## Full Models
+
+### Full Linear Model
+
+A full model including all candidate variables is fitted using standard logistic regression. The `plot(summary(model))` function plots the inter-quartile range odds ratios; the bars represent confidence intervals. If a confidence interval includes 1, the variable contributes little information to the model.
+```{r full-model}
+model1 <- lrm(day30 ~ age + sex + killip2 + dia + hyp + hrt + ant + pmi + htn + smk + lip + pan + fam + ste +st4 + ttr + bmi, data = train, x = TRUE, y = TRUE)
+
+plot(summary(model1), log = TRUE)
+ggplot(Predict(model1))
+```
+
+### Full Model with Splines
+
+Spline transformations are applied to `age` and `bmi`, since both show a non-linear relationship with the outcome `day30`.
+
+```{r full-splines}
+model2 <- lrm(day30 ~ rcs(age,3) + sex + killip2 + dia + hyp + hrt + ant + pmi + htn + smk + lip + pan + fam + ste +st4 + ttr + rcs(bmi,3), data = train, x = TRUE, y = TRUE)
+
+plot(summary(model2), log = TRUE)
+ggplot(Predict(model2))
+```
+
+## Variable Selection
+
+To avoid overfitting, variable selection is needed to exclude the ones that have no effect on the dependent variable. In order to do this, backward selection and lasso were chosen.
+
+### Backward Elimination
+
+The backward selection is applied to both the linear and the spline full models. This method implements a step-wise removal of predictors from the full model that have the least statistical significance. Variables selected are those with p-value larger than a specific threshold. This threshold could be chosen either by a fix value chosen at random or Akaike Information Criterion (AIC) or Bayesian Information Criterion (BIC).
+
+The `fastbw` function in R uses an AIC-based threshold to iteratively remove predictors with the least statistical contribution. It prints deletion statistics at each step and approximate parameter estimates for the reduced model.
+
+```{r bw-select}
+fastbw(model1)
+fastbw(model2)
+```
+
+Both models yield the same selected variables: **age, killip2, hypotension, heart rate, previous myocardial infarction, and ST elevation on the ECG**.
+
+#### Backward-Selected Linear Model
+
+```{r model-bw-lin}
+model3 <- lrm(day30 ~ age + killip2 + hyp + hrt + pmi + ste, data = train, x = TRUE, y = TRUE)
+plot(summary(model3), log = TRUE)
+ggplot(Predict(model3))
+```
+#### Backward-Selected Spline Model
+
+```{r model-bw-spli}
+model4 <- lrm(day30 ~ rcs(age,3) + killip2 + hyp + hrt + pmi + ste, data = train, x = TRUE, y = TRUE)
+plot(summary(model4), log = TRUE)
+ggplot(Predict(model4))
+```
+
+### LASSO Penalisation
+
+LASSO penalisation is applied to the full model to further address overfitting and multicollinearity. It adds a penalty term to the loss function, shrinking less important coefficients to zero and thus performing automatic variable selection. LASSO is applied to both the linear and the spline formulations.
+
+The linear LASSO additionally selects **anterior infarction location** and **time to relief of chest pain** (`ttr`) compared to backward selection.
+
+```{r lasso-lin}
+predictors <- c("age", "sex", "killip2", "dia",  "hyp", "hrt", "ant", "pmi", "htn", "smk", "lip", "pan", "fam", "ste", "st4", "ttr", "bmi")
+X_train1 <- model.matrix(day30 ~ . - 1, data = train[, c("day30", predictors)])
+Y_trainlasso <- train$day30
+cv_lasso1 <- cv.glmnet(X_train1, Y_trainlasso, family = "binomial", alpha = 1)
+print(coef(cv_lasso1, s = "lambda.1se"))
+plot(cv_lasso1)
+```
+
+
+```{r lasso-spline}
+formulaS <- as.formula("day30 ~ ns(age, df = 3) + sex + killip2 + dia + hyp + hrt + ant + pmi + htn + smk + lip + pan + fam + ste + st4 + ttr + ns(bmi, df = 3)")
+X_train2 <- model.matrix(formulaS, data = train)[, -1]
+cv_lasso2 <- cv.glmnet(X_train2, Y_trainlasso, family = "binomial", alpha = 1)
+plot(cv_lasso2)
+coefficients2 <- coef(cv_lasso2, s = "lambda.1se")
+print(coefficients2[coefficients2[, 1] != 0, , drop = FALSE])
+```
+
+
+#### LASSO-Selected Linear Model
+
+```{r model-ls-lin}
+model5 <- model_linear_lrm <- lrm(day30 ~ age + killip2 + hyp + hrt + ant+  pmi + ste + ttr, data = train, x = TRUE, y = TRUE)
+plot(summary(model5), log = TRUE)
+ggplot(Predict(model5))
+```
+
+#### LASSO-Selected Spline Model
+
+```{r model-ls-spli}
+model6 <- lrm(day30 ~ rcs(age, 3) + killip2 + hyp + hrt + pmi + ste, data = train, x = TRUE, y = TRUE)
+summary(model6)
+plot(summary(model6), log = TRUE)
+ggplot(Predict(model6))
+```
+
+At the end of this process we have **6 models**: 2 full models, 2 backward-selected models, and 2 LASSO-penalised models (each pair with and without splines).
+
+
+## Multicollinearity Check
+
+Variance Inflation Factors (VIF) are computed for all models to assess multicollinearity among predictors.
+
+```{r vif}
+vif(model1)
+vif(model2)
+vif(model3)
+vif(model4)
+vif(model5)
+vif(model6)
+```
+
+---
+
+# Question 4
+> Evaluate model’s performance in terms of discrimination. Evaluate model’s performance in terms of calibration.
+
+In predictive modelling, evaluating accuracy is as important as interpreting coefficients. Two types of validation are distinguished:
+
+- **Internal validation**: evaluation on the training dataset.
+- **External validation**: evaluation on the held-out test dataset.
+
+The final model is selected based on the best combined discrimination and calibration performance. Since no expert opinion is available, the choice is driven entirely by the statistical results.
+
+The six models under evaluation are:
+
+- **Model 1** – Full linear model
+- **Model 2** – Full model with splines
+- **Model 3** – Backward-selected linear model
+- **Model 4** – Backward-selected model with splines
+- **Model 5** – LASSO-selected linear model
+- **Model 6** – LASSO-selected model with splines
+
+## Internal Validation
+
+### Discrimination
+
+The `model$stats` output reports the **C statistic (AUC)** and **Dxy** (where Dxy = 2 × (C − 0.5)), which together describe how well the model ranks predicted risks. 
+
+The AUC is the probability that, when taking a random pair of observations, the observation with Y = 1 (a person dying within 30 days of an AMI) has a higher predicted probability than the other. It therefore gives the probability that the model correctly ranks the risk of such pairs. From the literature, an AUC close to 1 indicates good discrimination between sensitivity and specificity.
+
+All six models achieve AUC > 0.80; the full spline model (`model2`) reaches the highest value of **0.845**.
+
+```{r model-stats}
+stats1 <- model1$stats
+stats2 <- model2$stats
+stats3 <- model3$stats
+stats4 <- model4$stats
+stats5 <- model5$stats
+stats6 <- model6$stats
+stats_list <- list(stats1, stats2, stats3, stats4, stats5, stats6)
+```
+```{r stats-table}
+discrimination_table <- data.frame(
+  Model = c("Full linear", "Full spline", "Backward linear",
+            "Backward spline", "LASSO linear", "LASSO spline"),
+  AUC   = sapply(stats_list, function(s) {round(s["C"], 3) }),
+  Dxy   = sapply(stats_list, function(s) {round(s["Dxy"], 3) }),
+  Brier = sapply(stats_list, function(s) {round(s["Brier"], 3) }),
+  Likelihood  = sapply(stats_list, function(s) {round(s["Model L.R."], 3) }),
+  DF = sapply(stats_list, function(s) {round(s["d.f."], 3) })
+)
+
+knitr::kable(discrimination_table,
+             caption = "Internal discrimination")  %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("bordered"))
+```
+
+
+### Shrinkage (Overfitting)
+
+The **van Houwelingen–Le Cessie heuristic shrinkage estimate** (γ̂) quantifies overfitting. It estimates the likelihood that the model will reliably predict new observations — in other words, how much worse the model will perform on a new dataset compared to the training data. Values closer to 1 indicate less overfitting.
+
+
+
+```{r shrink-table}
+gammahat = function(s) {
+  round((s["Model L.R."] - s["d.f."]) / s["Model L.R."], 3)
+}
+
+shrinkage_table <- data.frame(
+  Model = c("1 - Full linear", "2 - Full spline", "3 - Backward linear",
+            "4 - Backward spline", "5 - LASSO linear", "6 - LASSO spline"),
+  
+  Shrinkage = sapply(stats_list, gammahat),
+  
+  Overfitting_pct = sapply(stats_list, function(s) {
+    gammaht <- gammahat(s)
+    paste0(round((1 - gammaht) * 100, 1), "%")
+  })
+)
+
+knitr::kable(
+  shrinkage_table,
+  col.names = c("Model", "Shrinkage", "Estimated overfitting"),
+  caption = "Van Houwelingen–Le Cessie heuristic shrinkage estimates",
+  row.names = FALSE
+) %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = "bordered"
+  )
+```
+
+### Bootstrap Validation (Discrimination and Slope Shrinkage)
+
+The bootstrap approach is used to assess the performance of each predictive model by estimating its uncertainty and improving predictive performance estimates. The `validate()` function with B = 200 bootstrap resamples returns optimism-corrected Dxy and calibration slope for all six models.
+
+The corrected Dxy (and the corresponding corrected C-index) shows how well each model would be expected to discriminate in new data, after accounting for optimism. The slope shrinkage quantifies how much the calibration slope departs from the ideal value of 1.
+
+
+```{r bootstrap-validation}
+set.seed(123)
+val1 <- validate(model1, B = 200)
+val2 <- validate(model2, B = 200)
+val3 <- validate(model3, B = 200)
+val4 <- validate(model4, B = 200)
+val5 <- validate(model5, B = 200)
+val6 <- validate(model6, B = 200)
+```
+
+```{r val-table}
+extract_val <- function(val) {
+  c(
+    Apparent_Dxy  = round(val["Dxy", "index.orig"],      3),
+    Corrected_Dxy = round(val["Dxy", "index.corrected"], 3),
+    Slope_Shrinkage = round(val["Slope", "index.orig"] - val["Slope", "index.corrected"], 3)
+  )
+}
+
+val_table <- data.frame(
+  Model = c("1 - Full linear", "2 - Full spline", "3 - Backward linear",
+            "4 - Backward spline", "5 - LASSO linear", "6 - LASSO spline"),
+  do.call(rbind, lapply(list(val1, val2, val3, val4, val5, val6), extract_val))
+)
+
+kable(val_table,
+             col.names = c("Model", "Apparent Dxy", "Corrected Dxy", "Slope Shrinkage"),
+             caption = "Internal Validation: Bootstrap selection") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("bordered"))
+```
+
+Model 2 (Full spline) has the highest Dxy, but does not have the best (smallest) slope shrinkage. The backward-spline and LASSO-spline models generally show the lowest slope shrinkage, suggesting better generalisability.
+
+### Calibration (Bootstrap)
+
+The `calibrate()` function estimates the mean absolute error (MAE) between
+estimated probabilities and observed event rates. Lower MAE indicates better
+calibration.
+
+```{r bootstrap-calibration}
+cal1 <- calibrate(model1, B = 200)
+cal2 <- calibrate(model2, B = 200)
+cal3 <- calibrate(model3, B = 200)
+cal4 <- calibrate(model4, B = 200)
+cal5 <- calibrate(model5, B = 200)
+cal6 <- calibrate(model6, B = 200)
+```
+
+Models 4 and 6 (backward-spline and LASSO-spline) achieve the lowest MAE, indicating the best internal calibration.
+
+```{r testing}
+extract_cal_mae <- function(cal) {
+  p     <- cal[, "predy"]
+  p.cal <- cal[, "calibrated.corrected"]
+  predicted <- attr(cal, "predicted")
+  
+  s   <- !is.na(p + p.cal)
+  err <- predicted - approx(p[s], p.cal[s], xout = predicted, ties = mean)$y
+  
+  round(mean(abs(err), na.rm = TRUE), 3)
+}
+
+cal_table <- data.frame(
+  Model = c("1 - Full linear", "2 - Full spline", "3 - Backward linear",
+            "4 - Backward spline", "5 - LASSO linear", "6 - LASSO spline"),
+  MAE = c(
+    extract_cal_mae(cal1), extract_cal_mae(cal2),
+    extract_cal_mae(cal3), extract_cal_mae(cal4),
+    extract_cal_mae(cal5), extract_cal_mae(cal6)
+  )
+)
+
+knitr::kable(cal_table,
+             col.names = c("Model", "Mean Absolute Error"),
+             caption = "Internal calibration: MAE") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "bordered")
+```
+
+```{r cal-plots-int, results='hide', fig.width=10, fig.height=8}
+par(mfrow = c(3, 2))
+plot(cal1); title(main = "Model 1 – Full linear")
+plot(cal2); title(main = "Model 2 – Full spline")
+plot(cal3); title(main = "Model 3 – Backward linear")
+plot(cal4); title(main = "Model 4 – Backward spline")
+plot(cal5); title(main = "Model 5 – LASSO linear")
+plot(cal6); title(main = "Model 6 – LASSO spline")
+```
+
+**AIC values** across models further support the preference for spline and reduced models:
+
+
+```{r cal-table}
+cal_table <- data.frame(
+  Model = c("1 - Full linear", "2 - Full spline", "3 - Backward linear",
+            "4 - Backward spline", "5 - LASSO linear", "6 - LASSO spline"),
+  AIC = round(c(
+    AIC(model1), AIC(model2), AIC(model3),
+    AIC(model4), AIC(model5), AIC(model6)
+  ), 2)
+)
+
+knitr::kable(cal_table,
+             col.names = c("Model", "AIC"), caption = "Internal calibration: AIC") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("bordered"))
+```
+
+Taken together, the internal validation results indicate that the backward-selection spline and LASSO-spline models offer the best combination of discrimination, low overfitting, and good calibration.
+
+## External Validation
+External validation assesses prediction performance on the held-out **test set**, providing an unbiased estimate of how each model performs on new data. Predicted probabilities are first extracted from each model and then used to compute the AUC and to evaluate calibration.
+
+### Discrimination on the Test Set
+
+```{r test-predictions}
+test1 <- predict(model1, newdata = test, type = "fitted")
+test2 <- predict(model2, newdata = test, type = "fitted")
+test3 <- predict(model3, newdata = test, type = "fitted")
+test4 <- predict(model4, newdata = test, type = "fitted")
+test5 <- predict(model5, newdata = test, type = "fitted")
+test6 <- predict(model6, newdata = test, type = "fitted")
+```
+
+```{r roc-curves}
+roc_list <- list(
+  "Full linear"     = roc(test$day30, test1, quiet = TRUE),
+  "Full spline"     = roc(test$day30, test2, quiet = TRUE),
+  "Backward linear" = roc(test$day30, test3, quiet = TRUE),
+  "Backward spline" = roc(test$day30, test4, quiet = TRUE),
+  "LASSO linear"    = roc(test$day30, test5, quiet = TRUE),
+  "LASSO spline"    = roc(test$day30, test6, quiet = TRUE)
+)
+
+ggroc(roc_list, legacy.axes = TRUE) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    title = "ROC Curves – Model Comparison on Test Dataset",
+    x = "1 – Specificity",
+    y = "Sensitivity",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9))
+```
+```{r auc-table}
+auc_table <- data.frame(
+  Model = names(roc_list),
+  AUC   = round(sapply(roc_list, pROC::auc), 3)
+)
+
+kable(auc_table, caption = "AUC", row.names = FALSE) %>% kable_styling(full_width = FALSE, bootstrap_options = "bordered")
+```
+
+The AUC shows that the model with best performance is the full model with spline (`model2`), though all the others also show good values above 0.80. Full models show marginally higher discrimination, which may be related to greater model flexibility.
+
+However, differences in AUC across models are small, suggesting broadly comparable discriminative performance.
+
+### Calibration
+Calibration was assessed both graphically using smoothed calibration curves and formally using the Hosmer–Lemeshow test.
+
+#### Visual Calibration
+
+```{r val-prob, fig.width=10, fig.height=8}
+par(mfrow = c(3, 2))
+cali1 <- val.prob(test1, test$day30, g = 10)
+title(main = "Model 1 – Full linear")
+
+cali2 <- val.prob(test2, test$day30, g = 10)
+title(main = "Model 2 – Full spline")
+
+cali3 <- val.prob(test3, test$day30, g = 10)
+title(main = "Model 3 – Backward linear")
+
+cali4 <- val.prob(test4, test$day30, g = 10)
+title(main = "Model 4 – Backward spline")
+
+cali5 <- val.prob(test5, test$day30, g = 10)
+title(main = "Model 5 – LASSO linear")
+
+cali6 <- val.prob(test6, test$day30, g = 10)
+title(main = "Model 6 – LASSO spline")
+```
+
+
+#### Hosmer–Lemeshow Test
+
+The **Hosmer–Lemeshow (HL) test** formally assesses whether the predicted probabilities match the observed event rates across deciles of risk. 
+
+- **p-value > 0.05** indicates that the model is well calibrated (no significant difference between predicted and observed)
+- **p-value ≤ 0.05** signals systematic miscalibration.
+
+```{r hosmer-lemeshow}
+pred_list <- list(
+  "1 - Full linear"     = test1,
+  "2 - Full spline"     = test2,
+  "3 - Backward linear" = test3,
+  "4 - Backward spline" = test4,
+  "5 - LASSO linear"    = test5,
+  "6 - LASSO spline"    = test6
+)
+
+hoslem_results <- data.frame(
+  Model = names(pred_list),
+  ChiSq = NA_real_,
+  p_value = NA_real_,
+  Calibration = NA_character_
+)
+
+for (i in seq_along(pred_list)) {
+  hl <- hoslem.test(test$day30, pred_list[[i]])
+
+  hoslem_results$ChiSq[i]   <- round(unname(hl$statistic), 3)
+  hoslem_results$p_value[i] <- round(hl$p.value, 4)
+  
+  hoslem_results$Calibration[i] <- ifelse(
+    hl$p.value > 0.05,
+    "Well-calibrated",
+    "Poor calibration"
+  )
+}
+
+knitr::kable(
+  hoslem_results,
+  caption = "Hosmer–Lemeshow calibration test across models",
+  row.names = FALSE
+) %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = "bordered"
+  )
+```
+
+Based on the Hosmer–Lemeshow test, **Model 4 (Backward spline)** and **Model 6 (LASSO spline)** are well calibrated (p > 0.05). The remaining models show statistically significant miscalibration on the test set.
+
+## Conclusion
+
+Based on both internal and external validation, the **Backward-selected model with splines (Model 4)** is selected as the final predictive model.
+Its key advantages are:
+
+- Good test-set AUC (0.805), comparable to more complex models.
+- Lowest slope shrinkage among spline models, indicating strong generalisability.
+- Mean absolute calibration error of 0.005 (joint lowest internally).
+- **Well-calibrated** on the test set per the Hosmer–Lemeshow test (p > 0.05), unlike the full models.
+- Parsimonious: uses only 6 predictors with spline terms for age, reducing overfitting risk compared to the 17-predictor full models.
+
+
+
